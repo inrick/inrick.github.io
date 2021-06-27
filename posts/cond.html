@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Transforming conditionals to data</title>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<p><a href="../index.html">&larr; Back</a></p>
+
+<h2>Transforming conditionals to data</h2>
+
+<p>Having been told that switch statements can be optimized into jump tables,
+it was never clear to me how such a transformation would be done efficiently
+for a simple C function such as the following:</p>
+
+<pre>
+bool is_vowel(char c) {
+  switch (c) {
+  case 'a':
+  case 'e':
+  case 'i':
+  case 'o':
+  case 'u':
+  case 'y':
+    return true;
+  }
+  return false;
+}
+</pre>
+
+<p>And, indeed, compiling the function with <code class="nowr">clang -O1</code>
+(version 11.1.0) produces the following assembly:</p>
+
+<pre>
+0x1140 &lt;+0&gt;:     add    edi,0xffffff9f
+0x1143 &lt;+3&gt;:     mov    eax,edi
+0x1145 &lt;+5&gt;:     ror    eax,1
+0x1147 &lt;+7&gt;:     cmp    eax,0xc
+0x114a &lt;+10&gt;:    ja     0x115a &lt;is_vowel+26&gt;
+0x114c &lt;+12&gt;:    shr    edi,1
+0x114e &lt;+14&gt;:    mov    eax,0x1495
+0x1153 &lt;+19&gt;:    mov    ecx,edi
+0x1155 &lt;+21&gt;:    shr    eax,cl
+0x1157 &lt;+23&gt;:    and    al,0x1
+0x1159 &lt;+25&gt;:    ret
+0x115a &lt;+26&gt;:    xor    eax,eax
+0x115c &lt;+28&gt;:    ret
+</pre>
+
+<p>I found this unexpected, but it turns out to be a straightforward
+transformation. It is simply encoding the valid cases in a bitmask. Let's go
+through it.</p>
+
+<p>At first the input is shifted by subtracting <code>0x61</code> (that is,
+adding the 32 bit two's complement <code>0xffffff9f</code> in this case):</p>
+
+<pre>
+0x1140 &lt;+0&gt;:     add    edi,0xffffff9f
+0x1143 &lt;+3&gt;:     mov    eax,edi
+</pre>
+
+<p>It has the following effect on each of the values being matched against:</p>
+
+<pre>
+a =  97 = 0x61             0 = 0b0000 0000 0000 0000
+e = 101 = 0x65             4 = 0b0000 0000 0000 0100
+i = 105 = 0x69   -0x61     8 = 0b0000 0000 0000 1000
+o = 111 = 0x6f  ------->  14 = 0b0000 0000 0000 1110
+u = 117 = 0x75            20 = 0b0000 0000 0001 0100
+y = 121 = 0x79            24 = 0b0000 0000 0001 1000
+</pre>
+
+<p>After which there is an early exit branch:</p>
+
+<pre>
+0x1145 &lt;+5&gt;:     ror    eax,1
+0x1147 &lt;+7&gt;:     cmp    eax,0xc
+0x114a &lt;+10&gt;:    ja     0x115a &lt;is_vowel+26&gt;
+</pre>
+
+<p>If <code>eax</code> contains an uneven number, rotate right
+(<code>ror</code>) yields a large integer if the result is interpreted as
+unsigned, since 1 is moved to the most significant bit. If <code>eax</code>
+contains an even number, the operation is equivalent to dividing by 2. Applied
+to our characters of interest this means:</p>
+
+<pre>
+a =  97 = 0x61             0            0 = 0x0
+e = 101 = 0x65             4            2 = 0x2
+i = 105 = 0x69   -0x61     8    ÷2      4 = 0x4
+o = 111 = 0x6f  ------->  14  ------>   7 = 0x7
+u = 117 = 0x75            20           10 = 0xa
+y = 121 = 0x79            24           12 = 0xc
+</pre>
+
+<p>Hence, the function may immediately exit if <code>eax</code> is not between
+<code>0</code> and <code>12 = 0xc</code> (<code>ja</code> = jump if above,
+treating the comparison as unsigned).</p>
+
+<p>All that remains is to decide if the number we have is 0, 2, 4, 7, 10, 12,
+or something else. Although, we for some reason go back to <code>edi</code>, which
+contains the result of subtracting <code>0x61</code> from the input character,
+and divide by two again, but now using shift right (<code>shr</code>).</p>
+
+<pre>
+0x114c &lt;+12&gt;:    shr    edi,1
+0x114e &lt;+14&gt;:    mov    eax,0x1495
+0x1153 &lt;+19&gt;:    mov    ecx,edi
+0x1155 &lt;+21&gt;:    shr    eax,cl
+0x1157 &lt;+23&gt;:    and    al,0x1
+0x1159 &lt;+25&gt;:    ret
+</pre>
+
+<p>Regardless, the result is now known to be between <code>0</code> and
+<code>0xc</code>, and we want to return true if it is 0, 2, 4, 7, 10 or 12. The
+number with ones in the desired positions is</p>
+
+<pre>0b0001 0100 1001 0101 = 0x1495</pre>
+
+<p>and all that remains is to mask out the bit corresponding to our number and
+return the result.</p>
+
+<hr>
+
+<p>In this case it seems to me that the compiler is in some sense unnecessarily
+clever. As the maximum range between the values we are interested in is
+<code>24 = 0x18</code>, it could have avoided the rotate and shift instructions
+(although skipping the rotate instruction means the branches will be hit
+differently). Turns out, this is what <code class="nowr">gcc -O1</code>
+(version 11.1.0, curiously aligning with the clang version number) does:
+
+<pre>
+is_vowel:
+0x1139 &lt;+0&gt;:     lea    ecx,[rdi-0x61]
+0x113c &lt;+3&gt;:     cmp    cl,0x18
+0x113f &lt;+6&gt;:     ja     0x114d &lt;is_vowel+20&gt;
+0x1141 &lt;+8&gt;:     mov    eax,0x1104111
+0x1146 &lt;+13&gt;:    shr    rax,cl
+0x1149 &lt;+16&gt;:    and    eax,0x1
+0x114c &lt;+19&gt;:    ret
+0x114d &lt;+20&gt;:    mov    eax,0x0
+0x1152 &lt;+25&gt;:    ret
+</pre>
+
+</body>
+</html>
